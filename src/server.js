@@ -11,7 +11,7 @@ import { runReconciliation } from "./reconcile.js";
 // "Not yet picked up" = the run's own Status field has no value yet. The Start step's
 // Status field is ReadOnly to Finance (they can't set it), and has no default, so a
 // freshly-submitted run's Status is genuinely blank until this service claims it — the
-// very first thing process() does is set it to "Processing", which is also what stops
+// very first thing processRun() does is set it to "Processing", which is also what stops
 // two poll ticks from grabbing the same run if one run takes longer than the interval.
 
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS) || 60_000;
@@ -43,7 +43,7 @@ async function pollOnce() {
       // by the next tick.
       await kf.updateProcessItem("Reconciliation_Run_A00", runId, { status: "Processing" });
       try {
-        await process(runId, run);
+        await processRun(runId, run);
       } catch (err) {
         console.error(`Reconciliation Run ${runId} failed:`, err);
         await kf.updateProcessItem("Reconciliation_Run_A00", runId, { status: "Failed" }).catch((e) => console.error("Also failed to mark run as Failed:", e));
@@ -56,7 +56,7 @@ async function pollOnce() {
   }
 }
 
-async function process(runId, run) {
+async function processRun(runId, run) {
   const bankMaster = await kf.getItem("FMCG_Bank_Master_A00", run.bank);
   const codeMap = bankMaster.bank_statement_code_mapping || []; // TODO: confirm the real child-table property name on a live Bank Master payload
 
