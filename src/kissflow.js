@@ -51,22 +51,45 @@ export async function updateFormItem(flowId, itemId, fields) {
   return call("PATCH", `/form/2/${ACCOUNT_ID}/${flowId}/${itemId}?_application_id=${APP_ID}`, fields);
 }
 
-/** Update one item in a Process flow (its own business fields, not the step). */
+/**
+ * Update one item in a Process flow's own business fields (not a workflow step action).
+ * Uses the "(Admin)" endpoint — the only one that can read/write a Process item's actual
+ * field values; the plain (non-admin) process endpoints only ever expose workflow
+ * metadata (status/step/assignee), never business data. Requires the access key's user
+ * to have Process Admin rights on this flow (the account admin key used throughout this
+ * build already qualifies — verified live, 2026-08-26).
+ */
 export async function updateProcessItem(flowId, itemId, fields) {
-  return call("PATCH", `/process/2/${ACCOUNT_ID}/${flowId}/${itemId}?_application_id=${APP_ID}`, fields);
+  return call("PUT", `/process/2/${ACCOUNT_ID}/admin/${flowId}/${itemId}`, fields);
 }
 
-/** List items in a flow, with optional filter/sort. See Kissflow REST docs for filter shape. */
-export async function listItems(flowId, { filter, sortBy, pageSize = 100, family = "form" } = {}) {
+/**
+ * List items in a Form-type flow, with optional filter/sort. See Kissflow REST docs for
+ * filter shape. For Process-type flows use listProcessItems() instead — the shapes and
+ * even the HTTP method differ (GET+query-params vs. POST+body), because Process listing
+ * only works at all through the "(Admin)" endpoint (see updateProcessItem's note).
+ */
+export async function listItems(flowId, { filter, sortBy, pageSize = 100 } = {}) {
   const q = new URLSearchParams({ _application_id: APP_ID, _response_type: "full", pageSize: String(pageSize) });
   if (sortBy) q.set("sortBy", sortBy);
   const body = filter ? { Filter: filter } : {};
-  return call("POST", `/${family}/2/${ACCOUNT_ID}/${flowId}/list?${q}`, body);
+  return call("POST", `/form/2/${ACCOUNT_ID}/${flowId}/list?${q}`, body);
 }
 
-/** Fetch one item by id. */
-export async function getItem(flowId, itemId, family = "form") {
-  return call("GET", `/${family}/2/${ACCOUNT_ID}/${flowId}/${itemId}?_application_id=${APP_ID}`);
+/** List items in a Process-type flow, with full business field values (Admin endpoint). */
+export async function listProcessItems(flowId, { pageNumber = 1, pageSize = 100 } = {}) {
+  const q = new URLSearchParams({ page_number: String(pageNumber), page_size: String(pageSize), apply_preference: "false" });
+  return call("GET", `/process/2/${ACCOUNT_ID}/admin/${flowId}/item?${q}`);
+}
+
+/** Fetch one item by id from a Form-type flow. */
+export async function getItem(flowId, itemId) {
+  return call("GET", `/form/2/${ACCOUNT_ID}/${flowId}/${itemId}?_application_id=${APP_ID}`);
+}
+
+/** Fetch one item by id from a Process-type flow, with full business field values (Admin endpoint). */
+export async function getProcessItem(flowId, itemId) {
+  return call("GET", `/process/2/${ACCOUNT_ID}/admin/${flowId}/${itemId}`);
 }
 
 // --- File download -----------------------------------------------------------

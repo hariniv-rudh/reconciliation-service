@@ -27,13 +27,14 @@ async function pollOnce() {
   if (polling) { console.log("poll: previous cycle still running, skipping this tick"); return; }
   polling = true;
   try {
-    // TODO verify with real data: confirm this actually returns recent/all runs and that
-    // `status` reads back as undefined/null/"" (not some other falsy shape) for an
-    // unprocessed run — log one real item once to check before relying on this in
-    // production. pageSize is generous since this fetches ALL runs and filters here in
-    // JS rather than trusting an unverified server-side filter syntax.
-    const res = await kf.listItems("Reconciliation_Run_A00", { family: "process", pageSize: 200 });
-    const runs = res?.Data || res || [];
+    // Process items are only readable through the "(Admin)" endpoint family — plain
+    // process endpoints (myitems, direct GET) expose only workflow metadata, never
+    // business fields (verified live, 2026-08-26; see runs/current/decisions.md in the
+    // parent app for the full story). listProcessItems() also naturally excludes Draft
+    // items never actually submitted, which is exactly the "genuinely awaiting
+    // reconciliation" set we want.
+    const res = await kf.listProcessItems("Reconciliation_Run_A00", { pageSize: 200 });
+    const runs = res?.Data || [];
     const pending = runs.filter((r) => !r.status);
 
     if (pending.length) console.log(`poll: found ${pending.length} run(s) awaiting reconciliation`);
@@ -57,7 +58,9 @@ async function pollOnce() {
 }
 
 async function processRun(runId, run) {
-  const bankMaster = await kf.getItem("FMCG_Bank_Master_A00", run.bank);
+  // Reference fields on a Process Admin response come back as a nested object
+  // ({_id, Name, ...}), not a bare id string — confirmed live, 2026-08-26.
+  const bankMaster = await kf.getItem("FMCG_Bank_Master_A00", run.bank?._id || run.bank);
   const codeMap = bankMaster.bank_statement_code_mapping || []; // TODO: confirm the real child-table property name on a live Bank Master payload
 
   const bankStatementUrl = run.bank_statement_file?.[0]?.Preview_URL || run.bank_statement_file?.[0]?.url;
