@@ -1,0 +1,15 @@
+{
+  "name": "fmcg-reconciliation-service",
+  "version": "1.0.0",
+  "description": "External integration script for the FMCG POS-Bank Reconciliation Kissflow app: parses the uploaded bank statement + sales report on a Reconciliation Run, matches them, and writes results back to Kissflow.",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "xlsx": "^0.18.5"
+  }
+}
