@@ -86,15 +86,31 @@ export function matchStoreNetworkDay(bankLines, salesLines, year, month, storeId
   return { lines, terminalDetail };
 }
 
-/** Look up the most recent existing Reconciliation Line for a store+network, for carry-forward. */
-async function getPreviousLine(storeRecordId, network) {
-  const res = await kf.listItems("Reconciliation_Line_A00", {
-    filter: { store: storeRecordId, network },
-    sortBy: "-date",
-    pageSize: 1,
-  });
-  const items = res?.Data || res || [];
-  return items[0] || null;
+/**
+ * Build the starting carry-forward state — one {balance, lineId} per STORE+NETWORK —
+ * from every existing Reconciliation Line, keeping only each key's most recent (by date).
+ *
+ * Deliberately does NOT use Kissflow's server-side `Filter` — verified live, 2026-08-27,
+ * that a capitalized `Filter` body (the only variant the server doesn't silently ignore)
+ * 500s regardless of shape tried (object filter, array-of-conditions), even on a trivial
+ * single-field Boolean filter on an unrelated form — while lowercase `filter`/`criteria`
+ * keys are accepted but silently no-op (confirmed by comparing result counts). Rather than
+ * keep guessing an undocumented query DSL, this fetches the whole table sorted by date
+ * (`sortBy` IS honored, confirmed working) and reduces client-side — the same robust
+ * pattern already used for Terminal/Store Master and the run-polling logic. Revisit if
+ * the ledger grows large enough that this full-table fetch becomes a real cost.
+ */
+async function loadCarryForwardState() {
+  const res = await kf.listItems("Reconciliation_Line_A00", { sortBy: "-date", pageSize: 5000 });
+  const items = res?.Data || [];
+  const state = new Map(); // "storeId|network" -> {balance, lineId}
+  for (const item of items) {
+    const storeId = item.store?._id || item.store;
+    const key = `${storeId}|${item.network}`;
+    if (state.has(key)) continue; // already saw this key's most recent (list is date-desc)
+    state.set(key, { balance: item.closing_carry_forward_balance ?? 0, lineId: item._id || item.id });
+  }
+  return state;
 }
 
 /**
@@ -129,6 +145,7 @@ export async function runReconciliation(ctx) {
   lines.sort((a, b) => a.date - b.date);
 
   const createdLineIds = new Map(); // "storeId|network|day" -> Reconciliation_Line item id
+  const carryForward = await loadCarryForwardState(); // "storeId|network" -> {balance, lineId}
   let flaggedCount = 0, matchedCount = 0;
 
   for (const line of lines) {
@@ -136,8 +153,9 @@ export async function runReconciliation(ctx) {
     const diff = bankAmount == null ? null : line.glAmount - bankAmount;
     const flagged = diff != null && Math.abs(diff) > TOLERANCE;
 
-    const prev = await getPreviousLine(line.storeId, line.network);
-    const openingBalance = prev?.closing_carry_forward_balance ?? 0;
+    const cfKey = `${line.storeId}|${line.network}`;
+    const prev = carryForward.get(cfKey);
+    const openingBalance = prev?.balance ?? 0;
 
     const fields = {
       reconciliation_run: runId,
@@ -147,12 +165,18 @@ export async function runReconciliation(ctx) {
       gl_amount: line.glAmount,
       bank_amount: bankAmount ?? undefined, // omit for AMEX rather than send null, if the API rejects null on a required-ish currency field
       opening_balance: openingBalance,
-      previous_line: prev?._id || prev?.id || undefined,
+      previous_line: prev?.lineId || undefined,
       status: bankAmount == null ? "Under Review" : flagged ? "Flagged" : "Matched", // AMEX always needs a human to fill in the bank side
     };
     const created = await kf.createFormItem("Reconciliation_Line_A00", fields);
     const lineId = created._id || created.id;
     createdLineIds.set(`${line.storeId}|${line.network}|${line.date.getUTCDate()}`, lineId);
+
+    // Advance this key's running balance for the NEXT line in this same run — the closing
+    // balance at creation time is always opening+diff, since Amount Claimed/Excess are
+    // only ever set later, by the (manually-configured) Discrepancy Review automations.
+    // Left untouched for AMEX (diff is null — nothing measurable to carry forward yet).
+    if (diff != null) carryForward.set(cfKey, { balance: openingBalance + diff, lineId });
 
     if (flagged) flaggedCount++; else if (bankAmount != null) matchedCount++;
   }

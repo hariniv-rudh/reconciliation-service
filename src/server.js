@@ -61,7 +61,13 @@ async function processRun(runId, run) {
   // Reference fields on a Process Admin response come back as a nested object
   // ({_id, Name, ...}), not a bare id string — confirmed live, 2026-08-26.
   const bankMaster = await kf.getItem("FMCG_Bank_Master_A00", run.bank?._id || run.bank);
-  const codeMap = bankMaster.bank_statement_code_mapping || []; // TODO: confirm the real child-table property name on a live Bank Master payload
+  // The child table's real live property key is "Table::<child model id>" (confirmed
+  // live, 2026-08-27) — not the plain field/table name. Each row also comes back with
+  // snake_case keys (line_type, not lineType) matching every other field in this app;
+  // normalize to what parseBankStatement.js expects.
+  const codeMap = (bankMaster["Table::flow-bank-code-mapping"] || []).map((r) => ({
+    code: r.code, network: r.network, lineType: r.line_type,
+  }));
 
   // A Process Attachment field's value is an array of {id, name, key, size, ...} —
   // there's no plain URL on it; downloading needs the dedicated Admin attachment
