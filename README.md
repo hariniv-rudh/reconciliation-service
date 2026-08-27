@@ -137,3 +137,16 @@ Because this polls Kissflow itself rather than waiting for a webhook, there's no
 configure on the Reconciliation Run process's Start step — deploying this service (with the
 uptime pinger above) is the whole setup. It'll pick up the very next Reconciliation Run
 Finance submits, within one poll interval.
+
+## Throughput
+
+Writing back is one record at a time — a real month (~8,000 Reconciliation Line +
+Terminal Settlement Detail rows for an 80-store chain) takes on the order of a day at
+observed throughput (~3-5 records/min). This isn't a hosting-tier limitation: Kissflow's
+Form API has no bulk-create endpoint (checked directly — `/bulk`, `/bulk-create`, and a
+raw array body all 404 or fail validation), and each record is inherently two sequential
+HTTP calls (see `kf.createFormItem`'s doc comment for why). Concurrency does not help
+either — see `createFormItem`'s doc comment on why calls are serialized process-wide.
+`runReconciliation` is resumable (see `loadExistingRunLines`/`loadExistingDetailKeys`), so
+a multi-hour run surviving a restart or redeploy partway through is expected and safe —
+it picks up where it left off rather than duplicating or losing work.
