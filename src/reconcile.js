@@ -91,8 +91,24 @@ export function matchStoreNetworkDay(bankLines, salesLines, year, month, storeId
     console.warn(`matchStoreNetworkDay: dropped ${droppedOutOfRangeDays} sales row(s) on out-of-range day-of-month (> ${lastDay} for ${year}-${month}) carrying a nonzero total of ${droppedOutOfRangeAmount} — check the Sales Report template's unused trailing day columns`);
   }
 
+  // AMEX must be excluded here too, mirroring the bank-side exclusion above (`if
+  // (line.network === "AMEX") continue;`) — AMEX is handled entirely by the dedicated
+  // supplement loop below, which correctly leaves bankAmount as `null` (awaiting manual
+  // entry, since AMEX settlement isn't on the bank statement in a matchable form).
+  // Without this exclusion, an AMEX sales entry still lands in `allKeys` (since salesBucket
+  // has it and bankBucket never does), and the main loop below computes
+  // `bankBucket.get(key)?.total || 0` — a real 0, not null — for it. That fabricated
+  // bankAmount=0 makes every AMEX line look "reconciled" (diff computes against 0) instead
+  // of "awaiting manual entry", and the duplicate-check in the supplement loop then skips
+  // adding its own (correct) null-bankAmount version, since a line for that key already
+  // exists. Verified live, 2026-08-27: ALL 2,016 AMEX lines in a real full-month run came
+  // out Matched/Flagged, none Under Review — the supplement loop below never actually
+  // contributed a single line.
   const salesBucket = new Map(); // key -> amount
-  for (const s of validSalesLines) salesBucket.set(bankKey(s.storeId, s.network, s.day), (salesBucket.get(bankKey(s.storeId, s.network, s.day)) || 0) + s.amount);
+  for (const s of validSalesLines) {
+    if (s.network === "AMEX") continue;
+    salesBucket.set(bankKey(s.storeId, s.network, s.day), (salesBucket.get(bankKey(s.storeId, s.network, s.day)) || 0) + s.amount);
+  }
 
   const allKeys = new Set([...bankBucket.keys(), ...salesBucket.keys()]);
   const lines = [];
