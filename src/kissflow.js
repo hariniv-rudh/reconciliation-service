@@ -24,7 +24,7 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 // Transient infrastructure errors (gateway/proxy hiccups, not our request being wrong) —
 // retried with backoff. Everything else (4xx, a real 500 FormError, etc.) fails immediately,
 // since retrying a bad request just repeats the same failure.
-const RETRYABLE_STATUSES = new Set([502, 503, 504]);
+const RETRYABLE_STATUSES = new Set([429, 502, 503, 504]);
 const MAX_RETRIES = 4;
 
 /**

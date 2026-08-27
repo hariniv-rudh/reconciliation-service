@@ -21,6 +21,22 @@ function daysInMonth(year, month) {
 }
 
 /**
+ * Run `worker(item)` over `items` with at most `limit` in flight concurrently. Plain
+ * async/await concurrency — JS is single-threaded, so two workers never actually execute
+ * at the same instant; they just interleave at each other's `await` points, which is enough
+ * to keep many HTTP round-trips in flight at once without any locking around shared state,
+ * as long as no worker's own read-modify-write of a piece of state spans an await that
+ * another worker could also touch (see call sites for why that's true here).
+ */
+async function runWithConcurrency(items, limit, worker) {
+  let idx = 0;
+  async function run() {
+    while (idx < items.length) await worker(items[idx++]);
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
+}
+
+/**
  * Match bank statement lines to sales-report lines at STORE + NETWORK + DAY grain,
  * applying the T+1 lag (a sale on day N settles on the bank statement dated N+1),
  * and only using PRINCIPAL SETTLEMENT bank lines (fees/VAT excluded).
@@ -238,57 +254,79 @@ export async function runReconciliation(ctx) {
   const existingRunLines = await loadExistingRunLines(runId); // resumability — see its own doc comment
   let flaggedCount = 0, matchedCount = 0, resumedLineCount = 0;
 
+  // Group into independent carry-forward chains, one per store+network. Each chain's own
+  // lines MUST stay strictly sequential (every line's opening balance is the previous
+  // line's closing balance in that SAME chain) — but different chains never depend on each
+  // other, so many chains can run concurrently for real throughput at this record volume.
+  // A single fully-sequential loop over ~8,000 records (2 HTTP round-trips each) was
+  // measured live, 2026-08-27, on a real run: ~3 records/min — the better part of two days
+  // for one month's reconciliation. Concurrency is across CHAINS, not within one, so
+  // ordering/correctness inside each chain is unaffected.
+  const CHAIN_CONCURRENCY = 8;
+  const chains = new Map(); // "storeId|network" -> ordered array of lines (already date-sorted)
   for (const line of lines) {
-    const bankAmount = line.bankAmount; // null for AMEX = leave blank for manual entry
-    const diff = bankAmount == null ? null : line.glAmount - bankAmount;
-    const flagged = diff != null && Math.abs(diff) > TOLERANCE;
-
     const cfKey = `${line.storeId}|${line.network}`;
-    const dayKey = `${line.storeId}|${line.network}|${line.date.getUTCDate()}`;
-    const prev = carryForward.get(cfKey);
-    const openingBalance = prev?.balance ?? 0;
-
-    let lineId = existingRunLines.get(dayKey);
-    if (lineId) {
-      resumedLineCount++;
-    } else {
-      const fields = {
-        reconciliation_run: kf.ref(runId),
-        store: kf.ref(line.storeId),
-        network: line.network,
-        date: isoDate(line.date),
-        gl_amount: line.glAmount,
-        bank_amount: bankAmount ?? undefined, // omit for AMEX rather than send null, if the API rejects null on a required-ish currency field
-        opening_balance: openingBalance,
-        previous_line: kf.ref(prev?.lineId),
-        status: bankAmount == null ? "Under Review" : flagged ? "Flagged" : "Matched", // AMEX always needs a human to fill in the bank side
-      };
-      const created = await kf.createFormItem("Reconciliation_Line_A00", fields);
-      lineId = created._id || created.id;
-    }
-    createdLineIds.set(dayKey, lineId);
-
-    // Advance this key's running balance for the NEXT line in this same run — the closing
-    // balance at creation time is always opening+diff, since Amount Claimed/Excess are
-    // only ever set later, by the (manually-configured) Discrepancy Review automations.
-    // Left untouched for AMEX (diff is null — nothing measurable to carry forward yet).
-    // Recomputed the same way whether this line is new or resumed from a prior attempt —
-    // parsing/matching is deterministic, so it reproduces the same diff either way, keeping
-    // the chain correct without needing to trust a previously-written row's own field value.
-    if (diff != null) carryForward.set(cfKey, { balance: openingBalance + diff, lineId });
-
-    if (flagged) flaggedCount++; else if (bankAmount != null) matchedCount++;
+    if (!chains.has(cfKey)) chains.set(cfKey, []);
+    chains.get(cfKey).push(line);
   }
+
+  await runWithConcurrency([...chains.entries()], CHAIN_CONCURRENCY, async ([cfKey, chainLines]) => {
+    for (const line of chainLines) {
+      const bankAmount = line.bankAmount; // null for AMEX = leave blank for manual entry
+      const diff = bankAmount == null ? null : line.glAmount - bankAmount;
+      const flagged = diff != null && Math.abs(diff) > TOLERANCE;
+
+      const dayKey = `${line.storeId}|${line.network}|${line.date.getUTCDate()}`;
+      const prev = carryForward.get(cfKey);
+      const openingBalance = prev?.balance ?? 0;
+
+      let lineId = existingRunLines.get(dayKey);
+      if (lineId) {
+        resumedLineCount++;
+      } else {
+        const fields = {
+          reconciliation_run: kf.ref(runId),
+          store: kf.ref(line.storeId),
+          network: line.network,
+          date: isoDate(line.date),
+          gl_amount: line.glAmount,
+          bank_amount: bankAmount ?? undefined, // omit for AMEX rather than send null, if the API rejects null on a required-ish currency field
+          opening_balance: openingBalance,
+          previous_line: kf.ref(prev?.lineId),
+          status: bankAmount == null ? "Under Review" : flagged ? "Flagged" : "Matched", // AMEX always needs a human to fill in the bank side
+        };
+        const created = await kf.createFormItem("Reconciliation_Line_A00", fields);
+        lineId = created._id || created.id;
+      }
+      createdLineIds.set(dayKey, lineId);
+
+      // Advance this chain's running balance for the NEXT line in the SAME chain — the
+      // closing balance at creation time is always opening+diff, since Amount
+      // Claimed/Excess are only ever set later, by the (manually-configured) Discrepancy
+      // Review automations. Left untouched for AMEX (diff is null — nothing measurable to
+      // carry forward yet). Recomputed the same way whether this line is new or resumed
+      // from a prior attempt — parsing/matching is deterministic, so it reproduces the same
+      // diff either way, keeping the chain correct without needing to trust a
+      // previously-written row's own field value. Safe under concurrency: only this
+      // chain's own worker ever reads or writes this cfKey.
+      if (diff != null) carryForward.set(cfKey, { balance: openingBalance + diff, lineId });
+
+      if (flagged) flaggedCount++; else if (bankAmount != null) matchedCount++;
+    }
+  });
   if (resumedLineCount) console.log(`runReconciliation: resumed ${resumedLineCount} Reconciliation_Line row(s) already written by a previous attempt at this run`);
 
+  // Terminal_Settlement_Detail rows have no ordering dependency on each other at all (unlike
+  // the Reconciliation_Line chains above), so they can all just go in one flat concurrent pool.
+  const DETAIL_CONCURRENCY = 10;
   const existingDetailKeys = await loadExistingDetailKeys(new Set(createdLineIds.values()));
   let resumedDetailCount = 0;
-  for (const t of terminalDetail) {
+  await runWithConcurrency(terminalDetail, DETAIL_CONCURRENCY, async (t) => {
     const lineId = createdLineIds.get(`${t.storeId}|${t.network}|${t.date.getUTCDate()}`);
-    if (!lineId) continue;
+    if (!lineId) return;
     const terminalRecordId = terminalRecordIdByTerminalId.get(t.terminalId);
-    if (!terminalRecordId) { console.warn(`No Terminal Master record found for terminal id "${t.terminalId}" — skipping its settlement-detail row`); continue; }
-    if (existingDetailKeys.has(`${lineId}|${t.terminalId}`)) { resumedDetailCount++; continue; }
+    if (!terminalRecordId) { console.warn(`No Terminal Master record found for terminal id "${t.terminalId}" — skipping its settlement-detail row`); return; }
+    if (existingDetailKeys.has(`${lineId}|${t.terminalId}`)) { resumedDetailCount++; return; }
     await kf.createFormItem("Terminal_Settlement_Detail_A00", {
       reconciliation_line: kf.ref(lineId),
       terminal: kf.ref(terminalRecordId),
@@ -297,7 +335,7 @@ export async function runReconciliation(ctx) {
       network: t.network,
       date: isoDate(t.date),
     });
-  }
+  });
   if (resumedDetailCount) console.log(`runReconciliation: resumed ${resumedDetailCount} Terminal_Settlement_Detail row(s) already written by a previous attempt at this run`);
 
   await kf.updateProcessItem("Reconciliation_Run_A00", runId, { status: "Reconciled" });
