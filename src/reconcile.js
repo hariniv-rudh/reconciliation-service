@@ -158,14 +158,14 @@ export async function runReconciliation(ctx) {
     const openingBalance = prev?.balance ?? 0;
 
     const fields = {
-      reconciliation_run: runId,
-      store: line.storeId,
+      reconciliation_run: kf.ref(runId),
+      store: kf.ref(line.storeId),
       network: line.network,
       date: isoDate(line.date),
       gl_amount: line.glAmount,
       bank_amount: bankAmount ?? undefined, // omit for AMEX rather than send null, if the API rejects null on a required-ish currency field
       opening_balance: openingBalance,
-      previous_line: prev?.lineId || undefined,
+      previous_line: kf.ref(prev?.lineId),
       status: bankAmount == null ? "Under Review" : flagged ? "Flagged" : "Matched", // AMEX always needs a human to fill in the bank side
     };
     const created = await kf.createFormItem("Reconciliation_Line_A00", fields);
@@ -187,10 +187,10 @@ export async function runReconciliation(ctx) {
     const terminalRecordId = terminalRecordIdByTerminalId.get(t.terminalId);
     if (!terminalRecordId) { console.warn(`No Terminal Master record found for terminal id "${t.terminalId}" — skipping its settlement-detail row`); continue; }
     await kf.createFormItem("Terminal_Settlement_Detail_A00", {
-      reconciliation_line: lineId,
-      terminal: terminalRecordId,
+      reconciliation_line: kf.ref(lineId),
+      terminal: kf.ref(terminalRecordId),
       matched_bank_amount: t.matchedBankAmount,
-      store: t.storeId,
+      store: kf.ref(t.storeId),
       network: t.network,
       date: isoDate(t.date),
     });

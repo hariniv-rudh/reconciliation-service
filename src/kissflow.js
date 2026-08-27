@@ -36,9 +36,25 @@ async function call(method, path, body) {
 
 // --- Form CRUD -------------------------------------------------------------
 
-/** Create one item in a Form-type flow. `fields` is {fieldId: value}. */
+/**
+ * Create one item in a Form-type flow. `fields` is {fieldId: value}.
+ *
+ * Two real API calls, not one — a Form's plain `POST` only ever creates/overwrites a
+ * DRAFT (response comes back with `_id: "draft_<userId>"` and `_is_draft: true` — the
+ * SAME draft slot every time, per user, regardless of flow). It must be finalized with a
+ * second call, `POST {flowId}/{draft_id}/submit`, which is what actually returns a real,
+ * distinct, persisted record id. Skipping this step doesn't error — it just silently
+ * overwrites the same one draft record on every call, so e.g. bulk-creating 80 stores in
+ * a loop produced exactly one leftover record. Verified live, 2026-08-27, after a bulk
+ * import appeared to "succeed" (each call returned 200) but only one record existed
+ * afterward. Process items do NOT have this problem — their `POST` returns a real,
+ * unique `InstanceId` directly, confirmed throughout this whole build.
+ */
 export async function createFormItem(flowId, fields) {
-  return call("POST", `/form/2/${ACCOUNT_ID}/${flowId}?_application_id=${APP_ID}`, fields);
+  const draft = await call("POST", `/form/2/${ACCOUNT_ID}/${flowId}?_application_id=${APP_ID}`, fields);
+  const draftId = draft._id;
+  if (!draftId) throw new Error(`createFormItem ${flowId}: draft response had no _id: ${JSON.stringify(draft).slice(0, 300)}`);
+  return call("POST", `/form/2/${ACCOUNT_ID}/${flowId}/${draftId}/submit?_application_id=${APP_ID}`, {});
 }
 
 /** Create one item in a Process flow (raises it at the Start step). */
@@ -64,16 +80,43 @@ export async function updateProcessItem(flowId, itemId, fields) {
 }
 
 /**
- * List items in a Form-type flow, with optional filter/sort. See Kissflow REST docs for
- * filter shape. For Process-type flows use listProcessItems() instead — the shapes and
- * even the HTTP method differ (GET+query-params vs. POST+body), because Process listing
- * only works at all through the "(Admin)" endpoint (see updateProcessItem's note).
+ * List items in a Form-type flow, with optional sort. See Kissflow REST docs for filter
+ * shape (though `Filter` is unusable — see loadCarryForwardState()'s note in reconcile.js).
+ * For Process-type flows use listProcessItems() instead — the shapes and even the HTTP
+ * method differ (GET+query-params vs. POST+body), because Process listing only works at
+ * all through the "(Admin)" endpoint (see updateProcessItem's note).
+ *
+ * Pagination gotcha (verified live, 2026-08-27): the page-size query param is
+ * `page_size`/`page_number` (snake_case), NOT `pageSize`/`pageNumber` — the camelCase
+ * form is silently ignored rather than rejected, capping every list at the server's
+ * default page size (10) regardless of what's passed. This went unnoticed for an entire
+ * session because a 10-row page still looks like a plausible success — it only surfaced
+ * once a real table held more than 10 rows and a dedup-by-existing-records check (in
+ * import-masters.mjs) silently mis-detected records as new that had actually already been
+ * created, causing duplicate creates on every re-run. Fixed by using the correct param
+ * name AND looping pages defensively (belt-and-braces — 1000 comfortably covers every
+ * table in this app today, but a table that ever grows past one page should not silently
+ * go back to returning only page 1).
  */
-export async function listItems(flowId, { filter, sortBy, pageSize = 100 } = {}) {
-  const q = new URLSearchParams({ _application_id: APP_ID, _response_type: "full", pageSize: String(pageSize) });
-  if (sortBy) q.set("sortBy", sortBy);
-  const body = filter ? { Filter: filter } : {};
-  return call("POST", `/form/2/${ACCOUNT_ID}/${flowId}/list?${q}`, body);
+export async function listItems(flowId, { filter, sortBy, pageSize = 1000 } = {}) {
+  const all = [];
+  let pageNumber = 1;
+  let meta = null;
+  for (;;) {
+    const q = new URLSearchParams({
+      _application_id: APP_ID, _response_type: "full",
+      page_size: String(pageSize), page_number: String(pageNumber),
+    });
+    if (sortBy) q.set("sortBy", sortBy);
+    const body = filter ? { Filter: filter } : {};
+    const res = await call("POST", `/form/2/${ACCOUNT_ID}/${flowId}/list?${q}`, body);
+    meta = res;
+    const page = res?.Data || [];
+    all.push(...page);
+    if (page.length < pageSize || all.length >= (res?.count ?? all.length)) break;
+    pageNumber++;
+  }
+  return { ...meta, Data: all };
 }
 
 /** List items in a Process-type flow, with full business field values (Admin endpoint). */
@@ -110,6 +153,20 @@ export async function downloadProcessAttachment(flowId, instanceId, fieldId, att
     { headers: { "X-Access-Key-Id": ACCESS_KEY_ID, "X-Access-Key-Secret": ACCESS_KEY_SECRET } });
   if (res.status >= 300) throw new Error(`downloadProcessAttachment ${flowId}/${instanceId}/${fieldId}/${attachmentId} -> ${res.status}`);
   return Buffer.from(await res.arrayBuffer());
+}
+
+/**
+ * Wrap a plain record id for a Reference field's payload shape. A bare string id on a
+ * Reference field silently 500s on create ("An unexpected error has occurred") with no
+ * indication the field is the cause — verified live, 2026-08-27, by reproducing the exact
+ * same generic FormError with a minimal payload, then bisecting field-by-field until
+ * dropping the Reference field alone made it succeed. The API wants `{_id: "..."}` instead;
+ * reads already come back in this same `{_id, Name, ...}` shape everywhere in this app
+ * (e.g. `run.bank`, `item.store` on a Reconciliation Line), so this just mirrors that on
+ * the way out. Pass through undefined/null so optional references stay omittable.
+ */
+export function ref(id) {
+  return id == null ? id : { _id: id };
 }
 
 export const ids = { ACCOUNT_ID, APP_ID };
