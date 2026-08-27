@@ -26,6 +26,7 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 // since retrying a bad request just repeats the same failure.
 const RETRYABLE_STATUSES = new Set([429, 502, 503, 504]);
 const MAX_RETRIES = 4;
+const REQUEST_TIMEOUT_MS = 30_000;
 
 /**
  * A single 502 killed an entire ~8,000-record run outright — verified live, 2026-08-27: a
@@ -34,23 +35,36 @@ const MAX_RETRIES = 4;
  * retried, the whole run's remaining work was lost with no way to resume mid-run. At this
  * call volume, hitting at least one transient blip is close to inevitable, so transient
  * statuses now retry with exponential backoff (500ms, 1s, 2s, 4s) before giving up.
+ *
+ * Every request also gets an explicit timeout. Without one, `fetch` waits forever on a
+ * connection that stalls instead of erroring — and a request that never resolves never
+ * throws, so it never reaches the retry logic above either; it just permanently wedges
+ * whichever concurrent worker is waiting on it. Verified live, 2026-08-27: a run went
+ * completely silent (zero new records) for 12+ minutes while the service's own health
+ * endpoint kept responding fine, consistent with one or more requests hung rather than
+ * failed. A stalled request now aborts at 30s and is retried like any other transient error.
  */
 async function call(method, path, body) {
   let attempt = 0;
   for (;;) {
     let res, text;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
       res = await fetch(BASE + path, {
         method,
         headers,
         body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
       });
       text = await res.text();
     } catch (networkErr) {
-      // A network-level failure (fetch itself threw — DNS blip, connection reset, etc.)
-      // is just as transient as a 502; retry it the same way.
+      // A network-level failure (fetch itself threw — DNS blip, connection reset, our own
+      // timeout abort, etc.) is just as transient as a 502; retry it the same way.
       if (attempt < MAX_RETRIES) { attempt++; await sleep(500 * 2 ** (attempt - 1)); continue; }
       throw new Error(`Kissflow ${method} ${path} -> network error after ${MAX_RETRIES} retries: ${networkErr.message}`);
+    } finally {
+      clearTimeout(timeout);
     }
     if (RETRYABLE_STATUSES.has(res.status) && attempt < MAX_RETRIES) {
       attempt++;
@@ -181,10 +195,19 @@ export async function getProcessItem(flowId, itemId) {
  * which field it came from (fieldId), the flow, and the item.
  */
 export async function downloadProcessAttachment(flowId, instanceId, fieldId, attachmentId) {
-  const res = await fetch(`${BASE}/process/2/${ACCOUNT_ID}/admin/${flowId}/${instanceId}/${fieldId}/attachment/${attachmentId}`,
-    { headers: { "X-Access-Key-Id": ACCESS_KEY_ID, "X-Access-Key-Secret": ACCESS_KEY_SECRET } });
-  if (res.status >= 300) throw new Error(`downloadProcessAttachment ${flowId}/${instanceId}/${fieldId}/${attachmentId} -> ${res.status}`);
-  return Buffer.from(await res.arrayBuffer());
+  // Longer timeout than call()'s — this moves a multi-MB file, not a small JSON payload,
+  // so it legitimately needs more time on a slow connection. Same reasoning as call()'s own
+  // timeout: an unbounded fetch that stalls hangs forever with nothing to catch it.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120_000);
+  try {
+    const res = await fetch(`${BASE}/process/2/${ACCOUNT_ID}/admin/${flowId}/${instanceId}/${fieldId}/attachment/${attachmentId}`,
+      { headers: { "X-Access-Key-Id": ACCESS_KEY_ID, "X-Access-Key-Secret": ACCESS_KEY_SECRET }, signal: controller.signal });
+    if (res.status >= 300) throw new Error(`downloadProcessAttachment ${flowId}/${instanceId}/${fieldId}/${attachmentId} -> ${res.status}`);
+    return Buffer.from(await res.arrayBuffer());
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 /**
