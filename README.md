@@ -150,3 +150,13 @@ either — see `createFormItem`'s doc comment on why calls are serialized proces
 `runReconciliation` is resumable (see `loadExistingRunLines`/`loadExistingDetailKeys`), so
 a multi-hour run surviving a restart or redeploy partway through is expected and safe —
 it picks up where it left off rather than duplicating or losing work.
+
+## One run at a time
+
+`pollOnce()` processes pending runs sequentially within a single tick, and `setInterval`
+never starts a new tick while one is still in flight (see the `polling` flag). This means
+a long-running run — a real month, or an accidentally-oversized test — fully blocks every
+other pending run behind it, including ones submitted after it. There's no way to cancel
+an in-flight run's own execution short of killing the process (a redeploy, which resumability
+makes safe); simply changing the stuck run's own Status field has no effect, since the
+already-running loop holds its own copy of the run in memory and never re-checks it.
