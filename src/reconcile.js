@@ -131,9 +131,15 @@ async function loadCarryForwardState() {
 export async function runReconciliation(ctx) {
   const { runId, bankStatementBuffer, salesReportBuffer, bankMaster, codeMap, terminals, stores, year, month } = ctx;
 
-  const storeIdByTerminal = new Map(terminals.map((t) => [t.terminal_id, t.store])); // terminal id text -> Kissflow Store record id
-  const terminalRecordIdByTerminalId = new Map(terminals.map((t) => [t.terminal_id, t.id])); // terminal id text -> Kissflow Terminal record id
-  const storeRecordByCode = new Map(stores.map((s) => [s.store_id, s.id])); // workbook store code -> Kissflow Store record id
+  // A Form list item's own id is always `_id`, never `id` — and a Reference field's value
+  // (Terminal Master's `store`) comes back as a nested `{_id, Name, ...}` object, not a bare
+  // string, the same as everywhere else in this app. Both were wrong here (using `.id` and
+  // trusting `t.store` was already a string) — verified live, 2026-08-27, after a real run
+  // crashed with a literal "[object Object]" id: `kf.ref(t.store)` had wrapped the whole
+  // nested object a second time, producing `{_id: {_id, Name, store_name}}`.
+  const storeIdByTerminal = new Map(terminals.map((t) => [t.terminal_id, t.store?._id || t.store])); // terminal id text -> Kissflow Store record id
+  const terminalRecordIdByTerminalId = new Map(terminals.map((t) => [t.terminal_id, t._id || t.id])); // terminal id text -> Kissflow Terminal record id
+  const storeRecordByCode = new Map(stores.map((s) => [s.store_id, s._id || s.id])); // workbook store code -> Kissflow Store record id
 
   const { lines: bankLines, unmatched } = parseBankStatement(bankStatementBuffer, bankMaster, codeMap);
   const salesLinesRaw = parseSalesReport(salesReportBuffer);
