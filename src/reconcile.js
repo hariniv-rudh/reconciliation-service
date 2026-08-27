@@ -16,6 +16,9 @@ function addDays(date, n) {
 function isoDate(date) {
   return date.toISOString().slice(0, 10);
 }
+function daysInMonth(year, month) {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate(); // day 0 of next month = last day of this one
+}
 
 /**
  * Match bank statement lines to sales-report lines at STORE + NETWORK + DAY grain,
@@ -52,8 +55,28 @@ export function matchStoreNetworkDay(bankLines, salesLines, year, month, storeId
     bucket.byTerminal.set(line.terminalId, (bucket.byTerminal.get(line.terminalId) || 0) + line.amount);
   }
 
+  // The Sales Report workbook always has day columns 1..31 regardless of the real month
+  // length (a fixed template) — a short month's unused trailing columns must be dropped
+  // here, not passed through, or `new Date(Date.UTC(year, month-1, day))` silently rolls
+  // a day like 30 in February into March 2nd (JS Date normalizes rather than throwing),
+  // corrupting the output date. Verified live, 2026-08-27: a real Feb run's sales tabs
+  // carried day values up to 31.
+  const lastDay = daysInMonth(year, month);
+  const validSalesLines = [];
+  let droppedOutOfRangeDays = 0, droppedOutOfRangeAmount = 0;
+  for (const s of salesLines) {
+    if (s.day > lastDay) {
+      if (s.amount) { droppedOutOfRangeDays++; droppedOutOfRangeAmount += s.amount; }
+      continue;
+    }
+    validSalesLines.push(s);
+  }
+  if (droppedOutOfRangeDays) {
+    console.warn(`matchStoreNetworkDay: dropped ${droppedOutOfRangeDays} sales row(s) on out-of-range day-of-month (> ${lastDay} for ${year}-${month}) carrying a nonzero total of ${droppedOutOfRangeAmount} — check the Sales Report template's unused trailing day columns`);
+  }
+
   const salesBucket = new Map(); // key -> amount
-  for (const s of salesLines) salesBucket.set(bankKey(s.storeId, s.network, s.day), (salesBucket.get(bankKey(s.storeId, s.network, s.day)) || 0) + s.amount);
+  for (const s of validSalesLines) salesBucket.set(bankKey(s.storeId, s.network, s.day), (salesBucket.get(bankKey(s.storeId, s.network, s.day)) || 0) + s.amount);
 
   const allKeys = new Set([...bankBucket.keys(), ...salesBucket.keys()]);
   const lines = [];
@@ -76,7 +99,7 @@ export function matchStoreNetworkDay(bankLines, salesLines, year, month, storeId
   }
 
   // AMEX: GL exists but Bank Amount is always left for manual entry (no terminal ref on the bank side).
-  for (const s of salesLines) {
+  for (const s of validSalesLines) {
     if (s.network !== "AMEX") continue;
     const key = bankKey(s.storeId, s.network, s.day);
     if (lines.some((l) => l.storeId === s.storeId && l.network === "AMEX" && l.date.getUTCDate() === s.day)) continue;
@@ -143,7 +166,30 @@ export async function runReconciliation(ctx) {
 
   const { lines: bankLines, unmatched } = parseBankStatement(bankStatementBuffer, bankMaster, codeMap);
   const salesLinesRaw = parseSalesReport(salesReportBuffer);
-  const salesLines = salesLinesRaw.map((s) => ({ ...s, storeId: storeRecordByCode.get(s.storeId) || s.storeId }));
+
+  // Only keep sales rows for a store we actually have a Store Master record for. A silent
+  // `|| s.storeId` fallback here (kept the raw workbook code, e.g. "13205") would flow a
+  // non-existent id all the way into `kf.ref(...)` and 404 the very first time one of these
+  // is written — Kissflow validates a Reference field against the real Store Master table.
+  // Verified live, 2026-08-27: the real Sales Report workbook has tabs for 127 distinct
+  // stores, but the Terminal-to-Store master workbook this app's Store Master was imported
+  // from only covers 80 — a genuine gap in the customer's own master data (47 stores have
+  // sales but no terminal/store record at all, so no bank data could ever match them
+  // either). These are skipped and reported rather than written as fabricated discrepancy
+  // lines; the fix belongs in the customer's master data, not the code.
+  const unmappedStoreTotals = new Map(); // raw workbook store code -> total amount skipped
+  const salesLines = [];
+  for (const s of salesLinesRaw) {
+    const mapped = storeRecordByCode.get(s.storeId);
+    if (!mapped) {
+      unmappedStoreTotals.set(s.storeId, (unmappedStoreTotals.get(s.storeId) || 0) + s.amount);
+      continue;
+    }
+    salesLines.push({ ...s, storeId: mapped });
+  }
+  if (unmappedStoreTotals.size) {
+    console.warn(`runReconciliation: ${unmappedStoreTotals.size} store(s) in the Sales Report have no Store Master record — skipped, sales data ignored for: ${[...unmappedStoreTotals.entries()].map(([id, total]) => `${id} (${total})`).join(", ")}`);
+  }
 
   const { lines, terminalDetail } = matchStoreNetworkDay(bankLines, salesLines, year, month, storeIdByTerminal);
 
@@ -204,5 +250,11 @@ export async function runReconciliation(ctx) {
 
   await kf.updateProcessItem("Reconciliation_Run_A00", runId, { status: "Reconciled" });
 
-  return { linesCreated: lines.length, flaggedCount, matchedCount, unmatchedBankRows: unmatched.length };
+  return {
+    linesCreated: lines.length,
+    flaggedCount,
+    matchedCount,
+    unmatchedBankRows: unmatched.length,
+    storesSkippedNoMasterRecord: unmappedStoreTotals.size,
+  };
 }
