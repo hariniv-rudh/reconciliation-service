@@ -63,13 +63,16 @@ async function processRun(runId, run) {
   const bankMaster = await kf.getItem("FMCG_Bank_Master_A00", run.bank?._id || run.bank);
   const codeMap = bankMaster.bank_statement_code_mapping || []; // TODO: confirm the real child-table property name on a live Bank Master payload
 
-  const bankStatementUrl = run.bank_statement_file?.[0]?.Preview_URL || run.bank_statement_file?.[0]?.url;
-  const salesReportUrl = run.sales_report_file?.[0]?.Preview_URL || run.sales_report_file?.[0]?.url;
-  if (!bankStatementUrl || !salesReportUrl) throw new Error("Run is missing one or both uploaded files");
+  // A Process Attachment field's value is an array of {id, name, key, size, ...} —
+  // there's no plain URL on it; downloading needs the dedicated Admin attachment
+  // endpoint, keyed by the field's own id and each file's `id` (verified live, 2026-08-27).
+  const bankStatementAttachment = run.bank_statement_file?.[0];
+  const salesReportAttachment = run.sales_report_file?.[0];
+  if (!bankStatementAttachment?.id || !salesReportAttachment?.id) throw new Error("Run is missing one or both uploaded files");
 
   const [bankStatementBuffer, salesReportBuffer] = await Promise.all([
-    kf.downloadAttachment(bankStatementUrl),
-    kf.downloadAttachment(salesReportUrl),
+    kf.downloadProcessAttachment("Reconciliation_Run_A00", runId, "bank_statement_file", bankStatementAttachment.id),
+    kf.downloadProcessAttachment("Reconciliation_Run_A00", runId, "sales_report_file", salesReportAttachment.id),
   ]);
 
   const terminalsRes = await kf.listItems("FMCG_Terminal_Master_A00", { pageSize: 1000 });

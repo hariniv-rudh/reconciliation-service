@@ -26,6 +26,15 @@ Kissflow's own automations (built manually in the builder, since this account al
 internal Process/Board/Form connector — see the note in the parent app's decisions.md) take
 it from there once a Reconciliation Line is flagged.
 
+**Reconciliation Run's business fields (Bank, Period, uploaded files, Status) are only
+readable through Kissflow's "(Admin)" Process API family** (`kf.getProcessItem`/
+`kf.listProcessItems` in `src/kissflow.js`) — the plain process endpoints (`myitems`, a
+direct item fetch) only ever expose workflow metadata like status/step/assignee, never
+actual field values, confirmed against Kissflow's own official API docs. These Admin
+endpoints require the access key's user to have **Process Admin** rights on this flow —
+the account admin key already used throughout this build qualifies, so nothing extra to
+configure, but keep this in mind if the key ever changes.
+
 ## Before you deploy — things to verify with real data
 
 This was built and unit-tested against your real sample files, but a few things depend on

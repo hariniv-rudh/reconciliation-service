@@ -95,14 +95,20 @@ export async function getProcessItem(flowId, itemId) {
 // --- File download -----------------------------------------------------------
 
 /**
- * Download an uploaded attachment's bytes. `attachmentField` is the value Kissflow
- * returns for an Attachment field on a run item — typically an array of
- * {Name, Preview_URL/Download_URL, ...}. Adjust the property name below once you've
- * inspected a real payload (log it once from the webhook and check).
+ * Download one attachment from a Process form field (Admin endpoint — the only one that
+ * works for a Process; there is no plain "Preview_URL" on the field value the way there
+ * might be for a Form). The endpoint 302-redirects to a signed, time-limited storage URL;
+ * `fetch` follows redirects by default, so this just works as a single call. Verified live,
+ * 2026-08-27: downloaded a real 4.4MB attachment, byte-for-byte correct.
+ *
+ * `field` is one entry from a Process item's Attachment-type field array, i.e.
+ * `run.bank_statement_file[0]` — needs its `id` (the attachment id) plus knowledge of
+ * which field it came from (fieldId), the flow, and the item.
  */
-export async function downloadAttachment(fileUrl) {
-  const res = await fetch(fileUrl, { headers: { "X-Access-Key-Id": ACCESS_KEY_ID, "X-Access-Key-Secret": ACCESS_KEY_SECRET } });
-  if (res.status >= 300) throw new Error(`download ${fileUrl} -> ${res.status}`);
+export async function downloadProcessAttachment(flowId, instanceId, fieldId, attachmentId) {
+  const res = await fetch(`${BASE}/process/2/${ACCOUNT_ID}/admin/${flowId}/${instanceId}/${fieldId}/attachment/${attachmentId}`,
+    { headers: { "X-Access-Key-Id": ACCESS_KEY_ID, "X-Access-Key-Secret": ACCESS_KEY_SECRET } });
+  if (res.status >= 300) throw new Error(`downloadProcessAttachment ${flowId}/${instanceId}/${fieldId}/${attachmentId} -> ${res.status}`);
   return Buffer.from(await res.arrayBuffer());
 }
 
