@@ -110,6 +110,43 @@ export function matchStoreNetworkDay(bankLines, salesLines, year, month, storeId
 }
 
 /**
+ * Resumability: fetch every Reconciliation_Line already written for THIS SPECIFIC run, so a
+ * retry after a crash (which WILL happen at this call volume — see kissflow.js's retry
+ * comment) skips re-creating what a previous attempt already wrote instead of duplicating
+ * it or requiring a manual purge. Verified necessary live, 2026-08-27: three separate
+ * crashes (a real bug, a real bug, then a transient Kissflow 502) each discarded an
+ * in-progress run's work with no way to continue, forcing a manual reset-then-cleanup cycle
+ * each time. Keyed the same way as `lines` themselves (store+network+day) so a resumed run
+ * can look each one up directly.
+ */
+async function loadExistingRunLines(runId) {
+  const res = await kf.listItems("Reconciliation_Line_A00", { pageSize: 5000 });
+  const items = res?.Data || [];
+  const byKey = new Map(); // "storeId|network|day" -> lineId
+  for (const item of items) {
+    if ((item.reconciliation_run?._id || item.reconciliation_run) !== runId) continue;
+    const storeId = item.store?._id || item.store;
+    const day = new Date(item.date).getUTCDate();
+    byKey.set(`${storeId}|${item.network}|${day}`, item._id || item.id);
+  }
+  return byKey;
+}
+
+/** Same idea as loadExistingRunLines, for the Terminal_Settlement_Detail side. */
+async function loadExistingDetailKeys(lineIds) {
+  const res = await kf.listItems("Terminal_Settlement_Detail_A00", { pageSize: 5000 });
+  const items = res?.Data || [];
+  const keys = new Set(); // "lineId|terminalId"
+  for (const item of items) {
+    const lineId = item.reconciliation_line?._id || item.reconciliation_line;
+    if (!lineIds.has(lineId)) continue;
+    const terminalId = item.terminal?.terminal_id;
+    if (terminalId) keys.add(`${lineId}|${terminalId}`);
+  }
+  return keys;
+}
+
+/**
  * Build the starting carry-forward state — one {balance, lineId} per STORE+NETWORK —
  * from every existing Reconciliation Line, keeping only each key's most recent (by date).
  *
@@ -198,7 +235,8 @@ export async function runReconciliation(ctx) {
 
   const createdLineIds = new Map(); // "storeId|network|day" -> Reconciliation_Line item id
   const carryForward = await loadCarryForwardState(); // "storeId|network" -> {balance, lineId}
-  let flaggedCount = 0, matchedCount = 0;
+  const existingRunLines = await loadExistingRunLines(runId); // resumability — see its own doc comment
+  let flaggedCount = 0, matchedCount = 0, resumedLineCount = 0;
 
   for (const line of lines) {
     const bankAmount = line.bankAmount; // null for AMEX = leave blank for manual entry
@@ -206,38 +244,51 @@ export async function runReconciliation(ctx) {
     const flagged = diff != null && Math.abs(diff) > TOLERANCE;
 
     const cfKey = `${line.storeId}|${line.network}`;
+    const dayKey = `${line.storeId}|${line.network}|${line.date.getUTCDate()}`;
     const prev = carryForward.get(cfKey);
     const openingBalance = prev?.balance ?? 0;
 
-    const fields = {
-      reconciliation_run: kf.ref(runId),
-      store: kf.ref(line.storeId),
-      network: line.network,
-      date: isoDate(line.date),
-      gl_amount: line.glAmount,
-      bank_amount: bankAmount ?? undefined, // omit for AMEX rather than send null, if the API rejects null on a required-ish currency field
-      opening_balance: openingBalance,
-      previous_line: kf.ref(prev?.lineId),
-      status: bankAmount == null ? "Under Review" : flagged ? "Flagged" : "Matched", // AMEX always needs a human to fill in the bank side
-    };
-    const created = await kf.createFormItem("Reconciliation_Line_A00", fields);
-    const lineId = created._id || created.id;
-    createdLineIds.set(`${line.storeId}|${line.network}|${line.date.getUTCDate()}`, lineId);
+    let lineId = existingRunLines.get(dayKey);
+    if (lineId) {
+      resumedLineCount++;
+    } else {
+      const fields = {
+        reconciliation_run: kf.ref(runId),
+        store: kf.ref(line.storeId),
+        network: line.network,
+        date: isoDate(line.date),
+        gl_amount: line.glAmount,
+        bank_amount: bankAmount ?? undefined, // omit for AMEX rather than send null, if the API rejects null on a required-ish currency field
+        opening_balance: openingBalance,
+        previous_line: kf.ref(prev?.lineId),
+        status: bankAmount == null ? "Under Review" : flagged ? "Flagged" : "Matched", // AMEX always needs a human to fill in the bank side
+      };
+      const created = await kf.createFormItem("Reconciliation_Line_A00", fields);
+      lineId = created._id || created.id;
+    }
+    createdLineIds.set(dayKey, lineId);
 
     // Advance this key's running balance for the NEXT line in this same run — the closing
     // balance at creation time is always opening+diff, since Amount Claimed/Excess are
     // only ever set later, by the (manually-configured) Discrepancy Review automations.
     // Left untouched for AMEX (diff is null — nothing measurable to carry forward yet).
+    // Recomputed the same way whether this line is new or resumed from a prior attempt —
+    // parsing/matching is deterministic, so it reproduces the same diff either way, keeping
+    // the chain correct without needing to trust a previously-written row's own field value.
     if (diff != null) carryForward.set(cfKey, { balance: openingBalance + diff, lineId });
 
     if (flagged) flaggedCount++; else if (bankAmount != null) matchedCount++;
   }
+  if (resumedLineCount) console.log(`runReconciliation: resumed ${resumedLineCount} Reconciliation_Line row(s) already written by a previous attempt at this run`);
 
+  const existingDetailKeys = await loadExistingDetailKeys(new Set(createdLineIds.values()));
+  let resumedDetailCount = 0;
   for (const t of terminalDetail) {
     const lineId = createdLineIds.get(`${t.storeId}|${t.network}|${t.date.getUTCDate()}`);
     if (!lineId) continue;
     const terminalRecordId = terminalRecordIdByTerminalId.get(t.terminalId);
     if (!terminalRecordId) { console.warn(`No Terminal Master record found for terminal id "${t.terminalId}" — skipping its settlement-detail row`); continue; }
+    if (existingDetailKeys.has(`${lineId}|${t.terminalId}`)) { resumedDetailCount++; continue; }
     await kf.createFormItem("Terminal_Settlement_Detail_A00", {
       reconciliation_line: kf.ref(lineId),
       terminal: kf.ref(terminalRecordId),
@@ -247,6 +298,7 @@ export async function runReconciliation(ctx) {
       date: isoDate(t.date),
     });
   }
+  if (resumedDetailCount) console.log(`runReconciliation: resumed ${resumedDetailCount} Terminal_Settlement_Detail row(s) already written by a previous attempt at this run`);
 
   await kf.updateProcessItem("Reconciliation_Run_A00", runId, { status: "Reconciled" });
 

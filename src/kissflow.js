@@ -19,19 +19,51 @@ const headers = {
   "Content-Type": "application/json",
 };
 
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// Transient infrastructure errors (gateway/proxy hiccups, not our request being wrong) —
+// retried with backoff. Everything else (4xx, a real 500 FormError, etc.) fails immediately,
+// since retrying a bad request just repeats the same failure.
+const RETRYABLE_STATUSES = new Set([502, 503, 504]);
+const MAX_RETRIES = 4;
+
+/**
+ * A single 502 killed an entire ~8,000-record run outright — verified live, 2026-08-27: a
+ * real Kissflow 502 Bad Gateway (their infra, an HTML Cloudflare-style error page, not a
+ * response to anything wrong with our request) hit partway through, and since nothing
+ * retried, the whole run's remaining work was lost with no way to resume mid-run. At this
+ * call volume, hitting at least one transient blip is close to inevitable, so transient
+ * statuses now retry with exponential backoff (500ms, 1s, 2s, 4s) before giving up.
+ */
 async function call(method, path, body) {
-  const res = await fetch(BASE + path, {
-    method,
-    headers,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
-  const text = await res.text();
-  let json;
-  try { json = text ? JSON.parse(text) : null; } catch { json = text; }
-  if (res.status >= 300) {
-    throw new Error(`Kissflow ${method} ${path} -> ${res.status}: ${JSON.stringify(json).slice(0, 500)}`);
+  let attempt = 0;
+  for (;;) {
+    let res, text;
+    try {
+      res = await fetch(BASE + path, {
+        method,
+        headers,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      });
+      text = await res.text();
+    } catch (networkErr) {
+      // A network-level failure (fetch itself threw — DNS blip, connection reset, etc.)
+      // is just as transient as a 502; retry it the same way.
+      if (attempt < MAX_RETRIES) { attempt++; await sleep(500 * 2 ** (attempt - 1)); continue; }
+      throw new Error(`Kissflow ${method} ${path} -> network error after ${MAX_RETRIES} retries: ${networkErr.message}`);
+    }
+    if (RETRYABLE_STATUSES.has(res.status) && attempt < MAX_RETRIES) {
+      attempt++;
+      await sleep(500 * 2 ** (attempt - 1));
+      continue;
+    }
+    let json;
+    try { json = text ? JSON.parse(text) : null; } catch { json = text; }
+    if (res.status >= 300) {
+      throw new Error(`Kissflow ${method} ${path} -> ${res.status}: ${JSON.stringify(json).slice(0, 500)}`);
+    }
+    return json;
   }
-  return json;
 }
 
 // --- Form CRUD -------------------------------------------------------------
