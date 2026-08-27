@@ -262,7 +262,17 @@ export async function runReconciliation(ctx) {
   // measured live, 2026-08-27, on a real run: ~3 records/min — the better part of two days
   // for one month's reconciliation. Concurrency is across CHAINS, not within one, so
   // ordering/correctness inside each chain is unaffected.
-  const CHAIN_CONCURRENCY = 8;
+  //
+  // CHAIN_CONCURRENCY=8 made things WORSE, not better, on Render's free tier — verified
+  // live: only 8 net-new records in 5+ minutes (vs ~15 expected from the sequential
+  // baseline), plus the health endpoint itself taking 42s to respond. Kissflow's own API
+  // handled 8 concurrent requests fine from a normal connection (verified directly), so this
+  // isn't Kissflow throttling us — it's the free tier's ~0.1 shared vCPU thrashing between
+  // many simultaneous TLS handshakes instead of completing requests quickly one at a time.
+  // Dialed down to a conservative 3 as a middle ground; revisit (up or down) based on
+  // observed throughput, and prefer a real vCPU (paid tier) over tuning this further if it's
+  // still not enough.
+  const CHAIN_CONCURRENCY = 3;
   const chains = new Map(); // "storeId|network" -> ordered array of lines (already date-sorted)
   for (const line of lines) {
     const cfKey = `${line.storeId}|${line.network}`;
@@ -318,7 +328,8 @@ export async function runReconciliation(ctx) {
 
   // Terminal_Settlement_Detail rows have no ordering dependency on each other at all (unlike
   // the Reconciliation_Line chains above), so they can all just go in one flat concurrent pool.
-  const DETAIL_CONCURRENCY = 10;
+  // Same free-tier CPU ceiling as CHAIN_CONCURRENCY above applies here too.
+  const DETAIL_CONCURRENCY = 3;
   const existingDetailKeys = await loadExistingDetailKeys(new Set(createdLineIds.values()));
   let resumedDetailCount = 0;
   await runWithConcurrency(terminalDetail, DETAIL_CONCURRENCY, async (t) => {
