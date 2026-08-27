@@ -255,24 +255,22 @@ export async function runReconciliation(ctx) {
   let flaggedCount = 0, matchedCount = 0, resumedLineCount = 0;
 
   // Group into independent carry-forward chains, one per store+network. Each chain's own
-  // lines MUST stay strictly sequential (every line's opening balance is the previous
-  // line's closing balance in that SAME chain) — but different chains never depend on each
-  // other, so many chains can run concurrently for real throughput at this record volume.
-  // A single fully-sequential loop over ~8,000 records (2 HTTP round-trips each) was
-  // measured live, 2026-08-27, on a real run: ~3 records/min — the better part of two days
-  // for one month's reconciliation. Concurrency is across CHAINS, not within one, so
-  // ordering/correctness inside each chain is unaffected.
+  // lines must stay strictly sequential (every line's opening balance is the previous
+  // line's closing balance in that SAME chain) — different chains never depend on each
+  // other, so this grouping would let them run concurrently for real throughput.
   //
-  // CHAIN_CONCURRENCY=8 made things WORSE, not better, on Render's free tier — verified
-  // live: only 8 net-new records in 5+ minutes (vs ~15 expected from the sequential
-  // baseline), plus the health endpoint itself taking 42s to respond. Kissflow's own API
-  // handled 8 concurrent requests fine from a normal connection (verified directly), so this
-  // isn't Kissflow throttling us — it's the free tier's ~0.1 shared vCPU thrashing between
-  // many simultaneous TLS handshakes instead of completing requests quickly one at a time.
-  // Dialed down to a conservative 3 as a middle ground; revisit (up or down) based on
-  // observed throughput, and prefer a real vCPU (paid tier) over tuning this further if it's
-  // still not enough.
-  const CHAIN_CONCURRENCY = 3;
+  // In practice that gave no usable speedup: kf.createFormItem() is now fully serialized
+  // process-wide (see its own doc comment in kissflow.js — Kissflow's Form draft slot is
+  // shared per USER, not per request, so any real concurrency there risks silently
+  // corrupting or losing records, confirmed live). Since virtually all of a chain's own
+  // work IS a createFormItem call, concurrency at this level just queues up behind that
+  // same lock with no benefit — so CHAIN_CONCURRENCY stays at 1 (plain sequential) rather
+  // than pretending there's parallelism here that doesn't actually exist. The grouping
+  // itself is kept because it's still the natural unit for correctness (each chain's
+  // opening/closing balance chain is self-contained), and because a genuinely concurrency-
+  // safe write path in the future (a bulk-create endpoint, multiple API users, etc.) could
+  // reuse it directly.
+  const CHAIN_CONCURRENCY = 1;
   const chains = new Map(); // "storeId|network" -> ordered array of lines (already date-sorted)
   for (const line of lines) {
     const cfKey = `${line.storeId}|${line.network}`;
@@ -326,10 +324,10 @@ export async function runReconciliation(ctx) {
   });
   if (resumedLineCount) console.log(`runReconciliation: resumed ${resumedLineCount} Reconciliation_Line row(s) already written by a previous attempt at this run`);
 
-  // Terminal_Settlement_Detail rows have no ordering dependency on each other at all (unlike
-  // the Reconciliation_Line chains above), so they can all just go in one flat concurrent pool.
-  // Same free-tier CPU ceiling as CHAIN_CONCURRENCY above applies here too.
-  const DETAIL_CONCURRENCY = 3;
+  // Terminal_Settlement_Detail rows have no ordering dependency on each other at all — but
+  // same reasoning as CHAIN_CONCURRENCY above: createFormItem() is serialized process-wide,
+  // so concurrency here wouldn't speed anything up either.
+  const DETAIL_CONCURRENCY = 1;
   const existingDetailKeys = await loadExistingDetailKeys(new Set(createdLineIds.values()));
   let resumedDetailCount = 0;
   await runWithConcurrency(terminalDetail, DETAIL_CONCURRENCY, async (t) => {

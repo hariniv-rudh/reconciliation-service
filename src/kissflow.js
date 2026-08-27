@@ -95,8 +95,31 @@ async function call(method, path, body) {
  * import appeared to "succeed" (each call returned 200) but only one record existed
  * afterward. Process items do NOT have this problem — their `POST` returns a real,
  * unique `InstanceId` directly, confirmed throughout this whole build.
+ *
+ * CRITICAL: that draft slot is shared per USER, not per request or per flow — there is
+ * exactly one `draft_<userId>` for our single API user at any given moment, account-wide.
+ * Two `createFormItem` calls in flight at once (from concurrent chains, say) race on that
+ * one slot: whichever call's draft-POST lands last silently overwrites the other's
+ * in-progress draft content, and whichever call's submit-POST lands first consumes the
+ * slot — so the OTHER call's submit then 404s ("could not be located", since the draft id
+ * it's holding no longer refers to a draft) or, worse, silently finalizes the wrong
+ * content into a record neither caller intended. Verified live, 2026-08-27: this produced
+ * exactly that 404 under both concurrency=8 and concurrency=3, and is a genuine data-
+ * integrity risk, not just a performance question — concurrent Form creation from this
+ * single API user is not just slower, it is unsafe. `formCreateQueue` below serializes the
+ * entire draft-then-submit sequence process-wide via a promise chain, so no two callers'
+ * critical sections can ever interleave, regardless of how many call this concurrently.
  */
-export async function createFormItem(flowId, fields) {
+let formCreateQueue = Promise.resolve();
+export function createFormItem(flowId, fields) {
+  const result = formCreateQueue.then(() => createFormItemExclusive(flowId, fields));
+  // Keep the queue alive even if this call fails — one rejection must not permanently wedge
+  // every subsequent createFormItem call waiting behind it.
+  formCreateQueue = result.then(() => {}, () => {});
+  return result;
+}
+
+async function createFormItemExclusive(flowId, fields) {
   const draft = await call("POST", `/form/2/${ACCOUNT_ID}/${flowId}?_application_id=${APP_ID}`, fields);
   const draftId = draft._id;
   if (!draftId) throw new Error(`createFormItem ${flowId}: draft response had no _id: ${JSON.stringify(draft).slice(0, 300)}`);
