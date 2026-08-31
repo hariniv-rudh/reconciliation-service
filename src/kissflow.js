@@ -25,7 +25,7 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 // retried with backoff. Everything else (4xx, a real 500 FormError, etc.) fails immediately,
 // since retrying a bad request just repeats the same failure.
 const RETRYABLE_STATUSES = new Set([429, 502, 503, 504]);
-const MAX_RETRIES = 4;
+const MAX_RETRIES = 8;
 const REQUEST_TIMEOUT_MS = 30_000;
 
 /**
@@ -34,7 +34,16 @@ const REQUEST_TIMEOUT_MS = 30_000;
  * response to anything wrong with our request) hit partway through, and since nothing
  * retried, the whole run's remaining work was lost with no way to resume mid-run. At this
  * call volume, hitting at least one transient blip is close to inevitable, so transient
- * statuses now retry with exponential backoff (500ms, 1s, 2s, 4s) before giving up.
+ * statuses retry with backoff before giving up.
+ *
+ * A 429 tells us exactly how long to wait — verified live, 2026-08-30: a run crashed with
+ * `{"error_code":"KISSFLOW_ERROR_15009", "retry_after": 25}` after exhausting the OLD fixed
+ * exponential schedule (500ms/1s/2s/4s ≈ 7.5s total), which never got anywhere near the 25s
+ * Kissflow itself was asking for — so every retry just hit the same still-active rate limit
+ * and the whole run died on a wait time we had all the information to avoid. Now a 429's own
+ * `retry_after` (seconds) is honored directly when present; other retryable statuses (502/
+ * 503/504, no such hint) fall back to exponential backoff (1s, 2s, 4s, 8s, ... capped at 30s).
+ * MAX_RETRIES raised from 4 to 8 to give a sustained rate-limit window more room to clear.
  *
  * Every request also gets an explicit timeout. Without one, `fetch` waits forever on a
  * connection that stalls instead of erroring — and a request that never resolves never
@@ -60,19 +69,22 @@ async function call(method, path, body) {
       text = await res.text();
     } catch (networkErr) {
       // A network-level failure (fetch itself threw — DNS blip, connection reset, our own
-      // timeout abort, etc.) is just as transient as a 502; retry it the same way.
-      if (attempt < MAX_RETRIES) { attempt++; await sleep(500 * 2 ** (attempt - 1)); continue; }
+      // timeout abort, etc.) is just as transient as a 502; retry it the same way. No
+      // server-supplied wait time available here, so exponential backoff only.
+      if (attempt < MAX_RETRIES) { attempt++; await sleep(Math.min(30_000, 1000 * 2 ** (attempt - 1))); continue; }
       throw new Error(`Kissflow ${method} ${path} -> network error after ${MAX_RETRIES} retries: ${networkErr.message}`);
     } finally {
       clearTimeout(timeout);
     }
-    if (RETRYABLE_STATUSES.has(res.status) && attempt < MAX_RETRIES) {
-      attempt++;
-      await sleep(500 * 2 ** (attempt - 1));
-      continue;
-    }
     let json;
     try { json = text ? JSON.parse(text) : null; } catch { json = text; }
+    if (RETRYABLE_STATUSES.has(res.status) && attempt < MAX_RETRIES) {
+      attempt++;
+      const retryAfterSec = typeof json?.retry_after === "number" ? json.retry_after : null;
+      const waitMs = retryAfterSec != null ? retryAfterSec * 1000 : Math.min(30_000, 1000 * 2 ** (attempt - 1));
+      await sleep(waitMs);
+      continue;
+    }
     if (res.status >= 300) {
       throw new Error(`Kissflow ${method} ${path} -> ${res.status}: ${JSON.stringify(json).slice(0, 500)}`);
     }
