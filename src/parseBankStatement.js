@@ -30,6 +30,36 @@
 import xlsx from "xlsx";
 
 /**
+ * Parse a "DD/MM/YYYY" transaction-date string the way this bank statement actually
+ * writes it (confirmed live, 2026-08-31, against the real Transaction Date column —
+ * bilingual header "تاريخ العملية / Transaction Date", values like "28/02/2026").
+ *
+ * `new Date(dateString)` was being used here directly, which — for an ambiguous
+ * slash-separated string like this — assumes US-convention MM/DD/YYYY, not DD/MM/YYYY.
+ * That silently corrupted every single date in the file two different ways: a day 1-12
+ * (ambiguous either way) got its day and month SWAPPED (real "05/02/2026" = Feb 5th
+ * parsed as May 2nd instead), while a day 13-31 (unambiguous — no 13th+ month exists)
+ * produced Invalid Date and was silently dropped by the `Number.isNaN(date?.getTime())`
+ * check below — never even counted as unmatched, just discarded. Together that meant
+ * well over half of every month's real transactions were either on the wrong date in
+ * the wrong month or missing outright. Explicit day/month/year parsing removes the
+ * ambiguity entirely instead of depending on which convention `Date`'s string parser
+ * happens to guess.
+ */
+function parseDdMmYyyy(s) {
+  const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(s.trim());
+  if (!m) return null;
+  const [, dd, mm, yyyy] = m;
+  const day = Number(dd), month = Number(mm), year = Number(yyyy);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const date = new Date(Date.UTC(year, month - 1, day));
+  // Guard against a rollover Date.UTC would otherwise accept silently (e.g. day=31 in a
+  // 30-day month) — confirm the constructed date's own fields match what was asked for.
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null;
+  return date;
+}
+
+/**
  * @param {Buffer} fileBuffer - raw .xlsx bytes
  * @param {object} bankMaster - the Bank Master record's fields
  * @param {Array<{code:string, network:string, lineType:string}>} codeMap - Bank Statement Code Mapping child rows
@@ -71,7 +101,11 @@ export function parseBankStatement(fileBuffer, bankMaster, codeMap) {
     const description = String(row[colDesc] || "").trim();
     const dateRaw = row[colDate];
     if (!description || Number.isNaN(amount)) continue;
-    const date = dateRaw instanceof Date ? dateRaw : new Date(dateRaw);
+    // dateRaw is text here ("DD/MM/YYYY", not a real Excel date cell — confirmed live) for
+    // every real bank file checked so far, but fall back to trusting an actual Date object
+    // (or ISO-ish string) if some other bank's export ever comes through with genuine
+    // date-typed cells instead of formatted text.
+    const date = dateRaw instanceof Date ? dateRaw : parseDdMmYyyy(String(dateRaw ?? "")) ?? new Date(dateRaw);
     if (Number.isNaN(date?.getTime())) continue;
 
     let terminalId = null, category = null, mapping = null;
