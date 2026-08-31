@@ -200,7 +200,14 @@ async function loadCarryForwardState() {
     const storeId = item.store?._id || item.store;
     const key = `${storeId}|${item.network}`;
     if (state.has(key)) continue; // already saw this key's most recent (list is date-desc)
-    state.set(key, { balance: item.closing_carry_forward_balance ?? 0, lineId: item._id || item.id });
+    // Field id is ClosingCarryForward_Balance, NOT closing_carry_forward_balance — the
+    // original formula field was broken live (wrong type, wrong field-name casing in its
+    // formula) and couldn't be fixed or deleted in place (still referenced elsewhere), so
+    // it was renamed to "...-dummy" and a fresh field created alongside it with a new
+    // internal id. Verified live, 2026-08-31, against the real Columns list. The renamed
+    // original still exists under the OLD id, read-only and still not computing correctly —
+    // reading that id here would silently reset every carry-forward chain to 0.
+    state.set(key, { balance: item.ClosingCarryForward_Balance ?? 0, lineId: item._id || item.id });
   }
   return state;
 }
