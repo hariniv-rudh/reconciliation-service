@@ -273,6 +273,7 @@ export async function runReconciliation(ctx) {
   lines.sort((a, b) => a.date - b.date);
 
   const createdLineIds = new Map(); // "storeId|network|day" -> Reconciliation_Line item id
+  const lineFieldsByDayKey = new Map(); // "storeId|network|day" -> {glAmount, diff} — for Terminal_Settlement_Detail's copied-down fields below
   const carryForward = await loadCarryForwardState(); // "storeId|network" -> {balance, lineId}
   const existingRunLines = await loadExistingRunLines(runId); // resumability — see its own doc comment
   let flaggedCount = 0, matchedCount = 0, resumedLineCount = 0;
@@ -330,6 +331,7 @@ export async function runReconciliation(ctx) {
         lineId = created._id || created.id;
       }
       createdLineIds.set(dayKey, lineId);
+      lineFieldsByDayKey.set(dayKey, { glAmount: line.glAmount, diff });
 
       // Advance this chain's running balance for the NEXT line in the SAME chain — the
       // closing balance at creation time is always opening+diff, since Amount
@@ -354,11 +356,20 @@ export async function runReconciliation(ctx) {
   const existingDetailKeys = await loadExistingDetailKeys(new Set(createdLineIds.values()));
   let resumedDetailCount = 0;
   await runWithConcurrency(terminalDetail, DETAIL_CONCURRENCY, async (t) => {
-    const lineId = createdLineIds.get(`${t.storeId}|${t.network}|${t.date.getUTCDate()}`);
+    const dayKey = `${t.storeId}|${t.network}|${t.date.getUTCDate()}`;
+    const lineId = createdLineIds.get(dayKey);
     if (!lineId) return;
     const terminalRecordId = terminalRecordIdByTerminalId.get(t.terminalId);
     if (!terminalRecordId) { console.warn(`No Terminal Master record found for terminal id "${t.terminalId}" — skipping its settlement-detail row`); return; }
     if (existingDetailKeys.has(`${lineId}|${t.terminalId}`)) { resumedDetailCount++; return; }
+    // GL Amount (Line) / Diff (Line) — the parent Reconciliation Line's own store+network+day
+    // totals, copied down onto every terminal row under it (per the app's own design: a
+    // "generation-time stored value", NOT a per-terminal split — every terminal for the same
+    // line shares the same GL/diff figure, same caveat as elsewhere in this file). Verified
+    // live, 2026-09-01: this was never actually being sent, so every Terminal_Settlement_Detail
+    // record's GL Amount/Diff was silently blank — found via a real report built against this
+    // dataform showing a $0 GL total despite real GL activity everywhere else.
+    const lineFields = lineFieldsByDayKey.get(dayKey);
     await kf.createFormItem("Terminal_Settlement_Detail_A00", {
       reconciliation_line: kf.ref(lineId),
       terminal: kf.ref(terminalRecordId),
@@ -366,6 +377,8 @@ export async function runReconciliation(ctx) {
       store: kf.ref(t.storeId),
       network: t.network,
       date: isoDate(t.date),
+      gl_amount: lineFields?.glAmount,
+      diff: lineFields?.diff ?? undefined,
     });
   });
   if (resumedDetailCount) console.log(`runReconciliation: resumed ${resumedDetailCount} Terminal_Settlement_Detail row(s) already written by a previous attempt at this run`);
